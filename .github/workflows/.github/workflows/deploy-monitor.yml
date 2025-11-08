@@ -1,0 +1,57 @@
+name: Render Status Monitor
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [ render_status_check ]
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Query Render service and write STATUS.md
+        run: |
+          set -e
+          RENDER_API_KEY="${{ secrets.RENDER_API_KEY }}"
+          if [ -z "$RENDER_API_KEY" ]; then RENDER_API_KEY="${{ github.event.client_payload.RENDER_API_KEY }}"; fi
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          SERVICE=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -c '.[] | select(.name=="sora2")' | head -n1)
+          SERVICE_ID=$(echo "$SERVICE" | jq -r '.id')
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
+            echo "# Deployment Status" > STATUS.md
+            echo "- Time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> STATUS.md
+            echo "- Service: sora2" >> STATUS.md
+            echo "- Status: not_found" >> STATUS.md
+            echo "- URL: pending" >> STATUS.md
+          else
+            SVC=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services/$SERVICE_ID")
+            URL=$(echo "$SVC" | jq -r '.serviceDetails.url // .url // empty')
+            STATUS=$(echo "$SVC" | jq -r '.serviceDetails.status // .status // empty')
+            REGION=$(echo "$SVC" | jq -r '.region // .serviceDetails.region // "unknown"')
+            echo "# Deployment Status" > STATUS.md
+            echo "- Time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> STATUS.md
+            echo "- Service: sora2" >> STATUS.md
+            echo "- Status: ${STATUS:-unknown}" >> STATUS.md
+            echo "- URL: ${URL:-pending}" >> STATUS.md
+            echo "- Region: ${REGION}" >> STATUS.md
+          fi
+
+      - name: Auto-commit STATUS.md
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(status): scheduled status update"
+          file_pattern: "STATUS.md"
