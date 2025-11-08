@@ -1,0 +1,156 @@
+name: Render Deploy (Automated)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Try applying Render Blueprint (render.yaml)
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          set -e
+          REPO="https://github.com/${{ github.repository }}"
+          BRANCH="${{ github.ref_name }}"
+          echo "Attempting blueprint apply for $REPO@$BRANCH"
+          BLUEPRINT_BODY=$(jq -n --arg repo "$REPO" --arg branch "$BRANCH" '{repo: $repo, branch: $branch}')
+          RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            https://api.render.com/v1/blueprints \
+            -d "$BLUEPRINT_BODY")
+          HTTP=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "Blueprint response (http=$HTTP):"
+          echo "$BODY" | jq . || echo "$BODY"
+          if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+            echo "BLUEPRINT_APPLIED=true" >> $GITHUB_ENV
+          else
+            echo "BLUEPRINT_APPLIED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Create service via Services API (fallback if blueprint failed)
+        if: env.BLUEPRINT_APPLIED == 'false'
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          set -e
+          echo "Fetching ownerId"
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          echo "$OWNERS" | jq . || true
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          if [ -z "$OWNER_ID" ] || [ "$OWNER_ID" = "null" ]; then echo "Failed to get ownerId"; exit 1; fi
+          echo "OWNER_ID=$OWNER_ID" >> $GITHUB_ENV
+
+          SERVICE_NAME="sora2"
+          REPO_URL="https://github.com/${{ github.repository }}"
+          BRANCH="${{ github.ref_name }}"
+
+          echo "Checking existing services"
+          EXIST=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -r --arg NAME "$SERVICE_NAME" '.[] | select(.name==$NAME) | .id' | head -n1)
+
+          if [ -n "$EXIST" ]; then
+            echo "Service exists: $EXIST"
+            echo "SERVICE_ID=$EXIST" >> $GITHUB_ENV
+          else
+            echo "Creating new service $SERVICE_NAME"
+            BODY=$(jq -n \
+              --arg ownerId "$OWNER_ID" \
+              --arg name "$SERVICE_NAME" \
+              --arg repo "$REPO_URL" \
+              --arg branch "$BRANCH" \
+              '{
+                ownerId: $ownerId,
+                name: $name,
+                type: "web_service",
+                env: "node",
+                plan: "starter",
+                buildCommand: "npm install --production",
+                startCommand: "node server.js",
+                autoDeploy: true,
+                repo: $repo,
+                branch: $branch,
+                region: "oregon"
+              }')
+            CREATE=$(curl -s -X POST -H "Authorization: Bearer $RENDER_API_KEY" -H "Content-Type: application/json" https://api.render.com/v1/services -d "$BODY")
+            echo "$CREATE" | jq . || echo "$CREATE"
+            SERVICE_ID=$(echo "$CREATE" | jq -r '.id')
+            if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then echo "Failed to create service"; exit 1; fi
+            echo "SERVICE_ID=$SERVICE_ID" >> $GITHUB_ENV
+          fi
+
+      - name: Set environment variables on Render
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          set -e
+          SERVICE_NAME="sora2"
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          SERVICE_ID=${SERVICE_ID:-$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -r --arg NAME "$SERVICE_NAME" '.[] | select(.name==$NAME) | .id' | head -n1)}
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then echo "Service ID not found"; exit 1; fi
+
+          # Load local env values as defaults
+          API_BASE_URL=""
+          API_KEY=""
+          UPLOAD_DIR="/opt/uploads"
+          PORT="3000"
+          HOST="0.0.0.0"
+          if [ -f .env ]; then
+            source <(sed -n 's/^[^#][^=]*=.*/&/p' .env)
+          fi
+
+          ENV_BODY=$(jq -n --arg API_BASE_URL "$API_BASE_URL" --arg API_KEY "$API_KEY" --arg UPLOAD_DIR "$UPLOAD_DIR" --arg PORT "$PORT" --arg HOST "$HOST" '{
+            envVars: [
+              {key:"API_BASE_URL", value:$API_BASE_URL, isSecret:false},
+              {key:"API_KEY", value:$API_KEY, isSecret:true},
+              {key:"UPLOAD_DIR", value:$UPLOAD_DIR, isSecret:false},
+              {key:"PORT", value:$PORT, isSecret:false},
+              {key:"HOST", value:$HOST, isSecret:false}
+            ]
+          }')
+
+          echo "Updating env vars for service $SERVICE_ID"
+          RES=$(curl -s -X PATCH -H "Authorization: Bearer $RENDER_API_KEY" -H "Content-Type: application/json" "https://api.render.com/v1/services/$SERVICE_ID/env-vars" -d "$ENV_BODY")
+          echo "$RES" | jq . || echo "$RES"
+
+      - name: Trigger deploy and wait for URL
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          set -e
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          SERVICE=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -c '.[] | select(.name=="sora2")' | head -n1)
+          SERVICE_ID=$(echo "$SERVICE" | jq -r '.id')
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then echo "Service ID not found"; exit 1; fi
+
+          echo "Triggering deploy for $SERVICE_ID"
+          DEP=$(curl -s -X POST -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services/$SERVICE_ID/deploys")
+          echo "$DEP" | jq . || echo "$DEP"
+
+          echo "Waiting for public URL..."
+          for i in $(seq 1 60); do
+            SVC=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services/$SERVICE_ID")
+            URL=$(echo "$SVC" | jq -r '.serviceDetails.url // .url // empty')
+            STATUS=$(echo "$SVC" | jq -r '.serviceDetails.status // .status // empty')
+            echo "status=$STATUS url=$URL"
+            if [ -n "$URL" ]; then
+              echo "PUBLIC_URL=$URL" >> $GITHUB_ENV
+              echo "Public URL: $URL"
+              break
+            fi
+            sleep 10
+          done
