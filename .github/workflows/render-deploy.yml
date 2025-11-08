@@ -1,0 +1,257 @@
+name: Render Deploy (Automated)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  repository_dispatch:
+    types: [ render_deploy ]
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Try applying Render Blueprint (render.yaml)
+        run: |
+          set -e
+          # Prefer secret; fallback to repository_dispatch payload
+          RENDER_API_KEY="${{ secrets.RENDER_API_KEY }}"
+          if [ -z "$RENDER_API_KEY" ]; then RENDER_API_KEY="${{ github.event.client_payload.RENDER_API_KEY }}"; fi
+          REPO="https://github.com/${{ github.repository }}"
+          BRANCH="${{ github.ref_name }}"
+          echo "Attempting blueprint apply for $REPO@$BRANCH"
+          BLUEPRINT_BODY=$(jq -n --arg repo "$REPO" --arg branch "$BRANCH" '{repo: $repo, branch: $branch}')
+          RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            https://api.render.com/v1/blueprints \
+            -d "$BLUEPRINT_BODY")
+          HTTP=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "Blueprint response (http=$HTTP):"
+          echo "$BODY" | jq . || echo "$BODY"
+          if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+            echo "BLUEPRINT_APPLIED=true" >> $GITHUB_ENV
+          else
+            echo "BLUEPRINT_APPLIED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Create service via Services API (fallback if blueprint failed)
+        if: env.BLUEPRINT_APPLIED == 'false'
+        run: |
+          set -e
+          RENDER_API_KEY="${{ secrets.RENDER_API_KEY }}"
+          if [ -z "$RENDER_API_KEY" ]; then RENDER_API_KEY="${{ github.event.client_payload.RENDER_API_KEY }}"; fi
+          echo "Fetching ownerId"
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          echo "$OWNERS" | jq . || true
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          if [ -z "$OWNER_ID" ] || [ "$OWNER_ID" = "null" ]; then echo "Failed to get ownerId"; exit 1; fi
+          echo "OWNER_ID=$OWNER_ID" >> $GITHUB_ENV
+
+          SERVICE_NAME="sora2"
+          REPO_URL="https://github.com/${{ github.repository }}"
+          BRANCH="${{ github.ref_name }}"
+
+          echo "Checking existing services"
+          EXIST=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -r --arg NAME "$SERVICE_NAME" '.[] | select(.name==$NAME) | .id' | head -n1)
+
+          if [ -n "$EXIST" ]; then
+            echo "Service exists: $EXIST"
+            echo "SERVICE_ID=$EXIST" >> $GITHUB_ENV
+          else
+            echo "Creating new service $SERVICE_NAME"
+            BODY=$(jq -n \
+              --arg ownerId "$OWNER_ID" \
+              --arg name "$SERVICE_NAME" \
+              --arg repo "$REPO_URL" \
+              --arg branch "$BRANCH" \
+              '{
+                ownerId: $ownerId,
+                name: $name,
+                type: "web_service",
+                env: "node",
+                plan: "starter",
+                buildCommand: "npm install --production",
+                startCommand: "node server.js",
+                autoDeploy: true,
+                repo: $repo,
+                branch: $branch,
+                region: "oregon"
+              }')
+            CREATE=$(curl -s -X POST -H "Authorization: Bearer $RENDER_API_KEY" -H "Content-Type: application/json" https://api.render.com/v1/services -d "$BODY")
+            echo "$CREATE" | jq . || echo "$CREATE"
+            SERVICE_ID=$(echo "$CREATE" | jq -r '.id')
+            if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then echo "Failed to create service"; exit 1; fi
+            echo "SERVICE_ID=$SERVICE_ID" >> $GITHUB_ENV
+          fi
+
+      - name: Set environment variables on Render
+        run: |
+          set -e
+          RENDER_API_KEY="${{ secrets.RENDER_API_KEY }}"
+          if [ -z "$RENDER_API_KEY" ]; then RENDER_API_KEY="${{ github.event.client_payload.RENDER_API_KEY }}"; fi
+          SERVICE_NAME="sora2"
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          SERVICE_ID=${SERVICE_ID:-$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -r --arg NAME "$SERVICE_NAME" '.[] | select(.name==$NAME) | .id' | head -n1)}
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then echo "Service ID not found"; exit 1; fi
+
+          # Load local env values as defaults
+          API_BASE_URL="https://lingkeapi.com"
+          API_KEY="$RENDER_API_KEY"
+          UPLOAD_DIR="/opt/uploads"
+          PORT="3000"
+          HOST="0.0.0.0"
+
+          ENV_BODY=$(jq -n --arg API_BASE_URL "$API_BASE_URL" --arg API_KEY "$API_KEY" --arg UPLOAD_DIR "$UPLOAD_DIR" --arg PORT "$PORT" --arg HOST "$HOST" '{
+            envVars: [
+              {key:"API_BASE_URL", value:$API_BASE_URL, isSecret:false},
+              {key:"API_KEY", value:$API_KEY, isSecret:true},
+              {key:"UPLOAD_DIR", value:$UPLOAD_DIR, isSecret:false},
+              {key:"PORT", value:$PORT, isSecret:false},
+              {key:"HOST", value:$HOST, isSecret:false}
+            ]
+          }')
+
+          echo "Updating env vars for service $SERVICE_ID"
+          RES=$(curl -s -X PATCH -H "Authorization: Bearer $RENDER_API_KEY" -H "Content-Type: application/json" "https://api.render.com/v1/services/$SERVICE_ID/env-vars" -d "$ENV_BODY")
+          echo "$RES" | jq . || echo "$RES"
+
+      - name: Ensure monitor workflow is present
+        run: |
+          set -e
+          mkdir -p .github/workflows
+          cat > .github/workflows/deploy-monitor.yml <<'YML'
+name: Render Status Monitor
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [ render_status_check ]
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Query Render service and write STATUS.md
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          set -e
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          SERVICE=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -c '.[] | select(.name=="sora2")' | head -n1)
+          SERVICE_ID=$(echo "$SERVICE" | jq -r '.id')
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
+            echo "# Deployment Status" > STATUS.md
+            echo "- Time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> STATUS.md
+            echo "- Service: sora2" >> STATUS.md
+            echo "- Status: not_found" >> STATUS.md
+            echo "- URL: pending" >> STATUS.md
+          else
+            SVC=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services/$SERVICE_ID")
+            URL=$(echo "$SVC" | jq -r '.serviceDetails.url // .url // empty')
+            STATUS=$(echo "$SVC" | jq -r '.serviceDetails.status // .status // empty')
+            REGION=$(echo "$SVC" | jq -r '.region // .serviceDetails.region // "unknown"')
+            echo "# Deployment Status" > STATUS.md
+            echo "- Time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> STATUS.md
+            echo "- Service: sora2" >> STATUS.md
+            echo "- Status: ${STATUS:-unknown}" >> STATUS.md
+            echo "- URL: ${URL:-pending}" >> STATUS.md
+            echo "- Region: ${REGION}" >> STATUS.md
+          fi
+
+      - name: Auto-commit STATUS.md
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(status): scheduled status update"
+          file_pattern: "STATUS.md"
+YML
+
+      - name: Auto-commit monitor workflow
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(workflow): ensure deploy-monitor present"
+          file_pattern: ".github/workflows/deploy-monitor.yml"
+
+      - name: Trigger deploy and wait for URL
+        run: |
+          set -e
+          RENDER_API_KEY="${{ secrets.RENDER_API_KEY }}"
+          if [ -z "$RENDER_API_KEY" ]; then RENDER_API_KEY="${{ github.event.client_payload.RENDER_API_KEY }}"; fi
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          SERVICE=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -c '.[] | select(.name=="sora2")' | head -n1)
+          SERVICE_ID=$(echo "$SERVICE" | jq -r '.id')
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then echo "Service ID not found"; exit 1; fi
+
+          echo "Triggering deploy for $SERVICE_ID"
+          DEP=$(curl -s -X POST -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services/$SERVICE_ID/deploys")
+          echo "$DEP" | jq . || echo "$DEP"
+
+          echo "Waiting for public URL..."
+          for i in $(seq 1 60); do
+            SVC=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services/$SERVICE_ID")
+            URL=$(echo "$SVC" | jq -r '.serviceDetails.url // .url // empty')
+            STATUS=$(echo "$SVC" | jq -r '.serviceDetails.status // .status // empty')
+            echo "status=$STATUS url=$URL"
+            if [ -n "$URL" ]; then
+              echo "PUBLIC_URL=$URL" >> $GITHUB_ENV
+              echo "Public URL: $URL"
+              break
+            fi
+            sleep 10
+          done
+
+      - name: Write STATUS.md
+        run: |
+          set -e
+          RENDER_API_KEY="${{ secrets.RENDER_API_KEY }}"
+          if [ -z "$RENDER_API_KEY" ]; then RENDER_API_KEY="${{ github.event.client_payload.RENDER_API_KEY }}"; fi
+          OWNERS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" https://api.render.com/v1/owners)
+          OWNER_ID=$(echo "$OWNERS" | jq -r '.[0].id')
+          SERVICE=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services?ownerId=$OWNER_ID" | jq -c '.[] | select(.name=="sora2")' | head -n1)
+          SERVICE_ID=$(echo "$SERVICE" | jq -r '.id')
+          SVC=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" "https://api.render.com/v1/services/$SERVICE_ID")
+          URL=$(echo "$SVC" | jq -r '.serviceDetails.url // .url // empty')
+          STATUS=$(echo "$SVC" | jq -r '.serviceDetails.status // .status // empty')
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "# Deployment Status" > STATUS.md
+          echo "- Time: $NOW" >> STATUS.md
+          echo "- Service: sora2" >> STATUS.md
+          echo "- Status: ${STATUS:-unknown}" >> STATUS.md
+          echo "- URL: ${URL:-pending}" >> STATUS.md
+          echo "- Region: $(echo "$SVC" | jq -r '.region // .serviceDetails.region // "unknown"')" >> STATUS.md
+
+      - name: Auto-commit STATUS.md
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(status): update deployment status"
+          file_pattern: "STATUS.md"
